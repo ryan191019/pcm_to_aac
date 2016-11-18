@@ -1,0 +1,538 @@
+/**
+ * @file divoom_da.c
+ * @brief  
+ * @author zhangyu
+ * @version 1.0
+ * @date 2015-09-03
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <fdk-aac/aacenc_lib.h>
+#include <alsa/asoundlib.h>
+
+typedef unsigned long   uint64;
+typedef unsigned int    uint32;
+typedef unsigned char   uint8;
+typedef char            int8;
+
+//#include "divoom.h"
+#include "debug.h"
+static snd_pcm_t *leave_handle = NULL;
+static snd_pcm_t *amazon_handle = NULL;
+static snd_pcm_t *noise_handle = NULL;
+
+//faacEncHandle hEncoder = NULL;
+//int temp_len = 0;
+char *buf_read = NULL;
+//char *buf_encode;
+int bits_per_sample, bits_per_frame;
+int chunk_bytes;
+//unsigned long samplesInput, maxBytesOutput;
+HANDLE_AACENCODER Enchandle = NULL;
+AACENC_InfoStruct info = { 0 };
+
+#define DIVOOM_TEMP_AAC "/tmp/111.aac"
+#define DIVOOM_TEMP "/tmp/arecord.pcm"
+
+int fd_temp = 0;
+int fd_record=0;
+
+void divoom_ad_mic_close()
+{
+	int err;
+	if(leave_handle)
+	{
+					err = snd_pcm_close(leave_handle);
+	}
+	
+	if(err < 0)
+	{
+		printf("[%s:%d]snd fail %d\n", __FILE__, __LINE__, snd_strerror(err));
+	}
+
+	if(buf_read)
+	{
+		free(buf_read);
+	}
+	
+	if(Enchandle != NULL)
+	{
+		aacEncClose(&Enchandle);
+	}
+	if(fd_temp)
+	{
+		close(fd_temp);
+	}
+	if(fd_record)
+	{
+		close(fd_record);	
+	}
+	leave_handle = NULL;
+	amazon_handle = NULL;
+	noise_handle = NULL;
+	buf_read = NULL;
+	return;
+}
+
+void divoom_ad_mic_read_leave_start()
+{
+	int err = 0;
+	AACENC_BufDesc in_buf = { 0 }, out_buf = { 0 };
+	AACENC_InArgs in_args = { 0 };
+	AACENC_OutArgs out_args = { 0 };
+	int in_identifier = IN_AUDIO_DATA;
+	int out_identifier = OUT_BITSTREAM_DATA;
+	int in_elem_size, out_size, in_size, out_elem_size;
+	uint8_t outbuf[2048];
+	void *out_ptr, *in_ptr;
+	//DEBUG_INFO("after");
+	if(leave_handle && buf_read )//&& hEncoder)
+	{
+		
+		
+		int size_read = chunk_bytes * 8 / bits_per_frame;// *8???--其实就是frames,多了一些运算gei申请空间用
+		DEBUG_INFO("size_read : %d",size_read);
+		out_ptr = outbuf;
+		out_size = sizeof(outbuf);
+		out_elem_size = 1;
+		out_buf.numBufs = 1;
+		out_buf.bufs = &out_ptr;
+		out_buf.bufferIdentifiers = &out_identifier;
+		out_buf.bufSizes = &out_size;
+		out_buf.bufElSizes = &out_elem_size;
+
+		while(1)
+		{
+			err = snd_pcm_readi(leave_handle, buf_read, size_read);
+			DEBUG_INFO("snd_pcm_readi : %d",err);
+			if(err == -EAGAIN || (err >= 0 && err < size_read))
+			{
+				snd_pcm_wait(leave_handle, 100);
+			}
+			else if(err == -EPIPE)
+			{
+				err = snd_pcm_prepare(leave_handle);
+				if(err < 0)
+				{
+					printf("snd fail:%s, %d, err = %d\n", snd_strerror(err), __LINE__, err);
+					return;
+				}
+			}
+			else if(err == -ESTRPIPE)
+			{
+				int res;
+				while ((res = snd_pcm_resume(leave_handle)) == -EAGAIN)
+					sleep(1);   /* wait until suspend flag is released */
+				if(res < 0)
+				{
+					if ((res = snd_pcm_prepare(leave_handle)) < 0) 
+					{
+						printf("suspend: prepare error: %s++%d\n", snd_strerror(res), res);
+					}
+				}
+			}
+			else if(err < 0)
+			{
+				printf("snd fail:%s, %d, err = %d\n", snd_strerror(err), __LINE__, err);
+				return;
+			}
+
+			if(err > 0)
+			{
+				
+				uint32 len =  err * bits_per_frame / 8;
+				
+				if( write(fd_record, buf_read,len) != len)
+				{		
+						perror("write fd_record failed\n");
+					
+				}
+				DEBUG_INFO("write : %d",len);	
+				
+				in_size = err * bits_per_frame / 8;
+				//memcpy(date+(*(len)), buf_read, err * bits_per_frame / 8);
+				//*len += err * bits_per_frame / 8;
+				signed short con_buf[in_size];
+				int i = 0;
+				for(i=0;i<in_size/2;i++)
+				{
+					char *temp = &buf_read[2*i];
+					con_buf[i] = temp[0] | (temp[1] << 8);
+				}
+				size_read -= err;
+				in_args.numInSamples = in_size/2;
+				in_ptr = (void *)con_buf;
+				//in_ptr = (void *)buf_read;
+				in_elem_size = 2;
+
+				in_buf.numBufs = 1;
+				in_buf.bufs = &in_ptr;
+				in_buf.bufferIdentifiers = &in_identifier;
+				in_buf.bufSizes = &in_size;
+				in_buf.bufElSizes = &in_elem_size;
+				err = aacEncEncode(Enchandle, &in_buf, &out_buf, &in_args, &out_args);
+
+				if(err != AACENC_OK)
+				{
+					printf("[%s:%d]This is encode fail!!!\n", __func__, __LINE__);
+				}
+				DEBUG_INFO("out_args.numOutBytes : %d",out_args.numOutBytes);	
+				if(out_args.numOutBytes == 0)
+					return;//转码0
+			
+				//memcpy(date+(*(len)), buf_read, err * bits_per_frame / 8);
+				//write(fd_temp, buf_read, err);
+				//*len += err * bits_per_frame / 8;
+				write(fd_temp, outbuf, out_args.numOutBytes);
+				//memcpy(date+(*(len)), outbuf, out_args.numOutBytes);
+				//*len += out_args.numOutBytes;
+				//temp_len += out_args.numOutBytes;
+				DEBUG_INFO("size_read : %d",size_read);
+			}
+		}
+	}
+}
+
+/*********************************************************
+ * * Copyright(c)		My style
+ * * Authored by Shaco Ma
+ * * CREATED TIME	: 2016年 11月 05日 星期六 11:53:02 CST
+ * * FUNCTION		:
+ * * AUTHOR			: Shaco Ma
+ * * IUPUT			: uint8 mic_choose
+ * * OUTPUT			:
+ * * DESCRIPTION	: 初始化mic设备
+ * *********************************************************/
+void divoom_ad_mic_open(void)
+{
+	snd_pcm_t *handle;
+	snd_pcm_hw_params_t *params;
+	//snd_pcm_sw_params_t *swparams;
+	int err = 0;
+	unsigned int rate = 8000;
+	unsigned int channel = 1;
+	unsigned int buffer_time = 0;
+	unsigned int  period_time = 0;
+	//snd_pcm_uframes_t start_threshold, stop_threshold;
+	snd_pcm_uframes_t frames = 16;
+	snd_pcm_uframes_t buffer_size = 32;//frames*2
+//	faacEncConfigurationPtr myFormat;
+//	unsigned int objectType = LOW;
+	
+	fd_temp = open(DIVOOM_TEMP_AAC, O_RDWR|O_CREAT, 0);
+	fd_record =  open(DIVOOM_TEMP, O_RDWR|O_CREAT, 0);
+	DEBUG_INFO("before snd_pcm_open");
+	err = snd_pcm_open(&handle, "default", SND_PCM_STREAM_CAPTURE, 0);//不知道#SND_PCM_NONBLOCK和#SND_PCM_ASYNC的区别
+	if(err < 0)
+	{
+		printf("snd fail: %s\n", snd_strerror(err));
+		return;
+	}
+	leave_handle = handle;
+	DEBUG_INFO("after snd_pcm_open");
+	err = snd_pcm_hw_params_malloc(&params);
+	if(err < 0)
+	{
+		printf("snd fail: %s\n", snd_strerror(err));
+		return;
+	}
+	
+	DEBUG_INFO("after snd_pcm_hw_params_malloc");
+//	err = snd_pcm_hw_params_malloc(&swparams);
+	if(err < 0)
+	{
+		printf("snd fail: %s\n", snd_strerror(err));
+		return;
+	}
+	err = snd_pcm_hw_params_any(handle, params);
+	if(err < 0)
+	{
+		printf("snd file: %s-%d\n", snd_strerror(err), __LINE__);
+		return;
+	}
+	DEBUG_INFO("after snd_pcm_hw_params_any");
+	err = snd_pcm_hw_params_set_access(handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);//交错
+	if(err < 0)
+	{
+		printf("snd file: %s-%d\n", snd_strerror(err), __LINE__);
+		return;
+	}
+	err = snd_pcm_hw_params_set_format(handle, params, SND_PCM_FORMAT_S16_LE);
+	if(err < 0)
+	{
+		printf("snd file: %s-%d\n", snd_strerror(err), __LINE__);
+		return;
+	}
+	err = snd_pcm_hw_params_set_channels(handle, params, channel);//channel
+	if(err < 0)
+	{
+		printf("snd file: %s-%d\n", snd_strerror(err), __LINE__);
+		return;
+	}
+	printf("rate = %u\n", rate);
+	err = snd_pcm_hw_params_set_rate_near(handle, params, &rate, 0);
+	if(err < 0)
+	{
+		printf("snd file: %s-%d\n", snd_strerror(err), __LINE__);
+		return;
+	}
+	DEBUG_INFO("after snd_pcm_hw_params_set_rate_near");
+	err = snd_pcm_hw_params_get_buffer_time_max(params, &buffer_time, 0);
+	if(err < 0)
+	{
+		printf("alloca file: %s-%d\n", snd_strerror(err), __LINE__);
+		return;
+	}
+	else if(err >= 0)
+	{
+		if(buffer_time > 500000)
+		{
+			buffer_time = 500000;
+		}
+		period_time = buffer_time/4;
+	}
+	printf("[%s:%d]The buffer_time = %d, period_time = %d\n", __func__, __LINE__, buffer_time, period_time);
+
+	if(period_time > 0)
+		err = snd_pcm_hw_params_set_period_time_near(handle, params, &period_time, 0);
+	else
+		err = snd_pcm_hw_params_set_period_size_near(handle, params, &frames, 0);
+	if(err < 0)
+	{
+		printf("snd file: %s-%d\n", snd_strerror(err), __LINE__);
+		return;
+	}
+	if(buffer_time > 0)
+		err = snd_pcm_hw_params_set_buffer_time_near(handle, params, &buffer_time, 0);
+	else
+		err = snd_pcm_hw_params_set_buffer_size_near(handle, params, &buffer_size);
+	if(err < 0)
+	{
+		printf("alloca file: %s-%d\n", snd_strerror(err), __LINE__);
+		return;
+	}
+	
+		DEBUG_INFO("before snd_pcm_hw_params");
+
+	err = snd_pcm_hw_params(handle, params);
+	if(err < 0)
+	{
+		printf("snd file: %s-%d\n", snd_strerror(err), __LINE__);
+		return;
+	}
+
+	snd_pcm_hw_params_get_period_size(params, &frames, 0);
+	snd_pcm_hw_params_get_buffer_size(params, &buffer_size);//check
+	if(frames == buffer_size)
+	{
+		printf("[%s:%d]frames = %d, buffer_size = %d\n", __func__, __LINE__, frames, buffer_size);
+		divoom_ad_mic_close();
+		return;
+	}
+	DEBUG_INFO("before aacEncOpen");
+
+	/*fdk-aac encode start*/
+	err = aacEncOpen(&Enchandle, 0, channel);
+	if(err != 0)
+	{
+		printf("[%s:%d]Encaac open fail!!!\n", __func__, __LINE__);
+	}
+	err = aacEncoder_SetParam(Enchandle, AACENC_AOT, 2);
+	if(err != 0)
+	{
+		printf("[%s:%d]Encaac open fail!!!\n", __func__, __LINE__);
+	}
+	err = aacEncoder_SetParam(Enchandle, AACENC_SAMPLERATE, rate);
+	if(err != 0)
+	{
+		printf("[%s:%d]Encaac open fail!!!\n", __func__, __LINE__);
+	}
+	err = aacEncoder_SetParam(Enchandle, AACENC_CHANNELMODE, MODE_1);
+	if(err != 0)
+	{
+		printf("[%s:%d]Encaac open fail!!!\n", __func__, __LINE__);
+	}
+	err = aacEncoder_SetParam(Enchandle, AACENC_CHANNELORDER, 1);//???
+	if(err != 0)
+	{
+		printf("[%s:%d]Encaac open fail!!!\n", __func__, __LINE__);
+	}
+	err = aacEncoder_SetParam(Enchandle, AACENC_BITRATE, 96000);
+	if(err != 0)
+	{
+		printf("[%s:%d]Encaac open fail!!!\n", __func__, __LINE__);
+	}
+	//err = aacEncoder_SetParam(handle, AACENC_BITRATEMODE, 0);
+	//if(err != 0)
+	//{
+	//	printf("[%s:%d]Encaac open fail!!!\n", __func__, __LINE__);
+	//}
+	err = aacEncoder_SetParam(Enchandle, AACENC_TRANSMUX, 2);//ADTS
+	if(err != 0)
+	{
+		printf("[%s:%d]Encaac open fail!!!\n", __func__, __LINE__);
+	}
+	err = aacEncoder_SetParam(Enchandle, AACENC_AFTERBURNER, 1);//加力???
+	if(err != 0)
+	{
+		printf("[%s:%d]Encaac open fail!!!\n", __func__, __LINE__);
+	}
+	err = aacEncEncode(Enchandle, NULL, NULL, NULL, NULL);
+	if(err != 0)
+	{
+		printf("[%s:%d]Encaac open fail!!!\n", __func__, __LINE__);
+	}
+	err = aacEncInfo(Enchandle, &info);
+	if(err != 0)
+	{
+		printf("[%s:%d]Encaac open fail!!!\n", __func__, __LINE__);
+	}
+	printf("info.maxOutBufBytes = %d\n,	\
+			info.maxAncBytes = %d\n,	\
+			info.inBufFillLevel = %d\n,	\
+			info.inputChannels = %d\n,	\
+			info.frameLength = %d\n,	\
+			info.encoderDelay =%d\n,	\
+			info.confSize = %d\n", \
+			info.maxOutBufBytes,	\
+			info.maxAncBytes,	\
+			info.inBufFillLevel,	\
+			info.inputChannels,	\
+			info.frameLength,	\
+			info.encoderDelay,	\
+			info.confSize);
+	/*fdk-aac encode end*/
+
+	//frames = samplesInput/2;
+	
+	//frames = 380;
+	printf("[%s:%d]frames = %d, buffer_size = %d\n", __func__, __LINE__, frames, buffer_size);
+	bits_per_sample = snd_pcm_format_physical_width(SND_PCM_FORMAT_S16_LE);
+	bits_per_frame = bits_per_sample * channel;// * channel
+	chunk_bytes = frames * bits_per_frame / 8;//? /8?
+	//chunk_bytes是用来申请空间用的，但是两倍的足够用了
+	//buf_read = (char *)divoom_malloc(chunk_bytes, DIVOOM_MODEL_LEAVE_MSG, __LINE__, __FILE__);//frames*2(SND_PCM_FORMAT_S16_LE--16位采样，采样一次放两个char)*channel
+	//buf_read = (char *)malloc(chunk_bytes);
+	
+	buf_read = malloc( chunk_bytes*2);
+	if (buf_read == NULL) {
+		divoom_ad_mic_close();
+		return;
+	}
+	snd_pcm_hw_params_free(params);
+	
+	
+
+
+	printf("buf_read size is %d\n", frames*2*1);
+
+	printf("PCM handle name = '%s'\n", snd_pcm_name(handle));
+	printf("PCM state = %s\n", snd_pcm_state_name(snd_pcm_state(handle)));
+		DEBUG_INFO("after");
+	return;
+}
+
+/*********************************************************
+ * * Copyright(c)		My style
+ * * Authored by Shaco Ma
+ * * CREATED TIME	: 2016年 11月 05日 星期六 10:03:27 CST
+ * * FUNCTION		:
+ * * AUTHOR			: Shaco Ma
+ * * IUPUT			: uint8 choose
+ * * OUTPUT			:
+ * * DESCRIPTION	:
+ * *********************************************************/
+uint8 divoom_ad_get_priority(uint8 choose)
+{
+
+	return 1;
+}
+
+/*
+ * @brief      打开AD,让设备采集数据
+ * @param[in]   pcallback  有数据来，通知系统
+ * @return      none  
+ */
+
+//DIVOOM_AD_CALLBACK divom_ad_pcallback = NULL;
+void divoom_ad_init( )
+{
+		divoom_ad_mic_open();
+
+}
+
+
+void divoom_ad_callback_handle(uint8 *data, uint32 len)
+{
+	//uint32 i = 0;
+#if 0
+	debug("ad len %d\n");
+	for(i=0;i<len;i++)
+	{
+		debug("0x%x ", data[i]);
+	}
+	debug("\n");
+#endif
+//	if(divom_ad_pcallback != NULL)
+//		divom_ad_pcallback(data, len);
+}
+
+/*
+ * @brief      关闭AD
+ * @param[in]   none
+ * @return      none  
+ */
+void divoom_ad_exit()
+{
+	//divoom_uart_arm_send(DIVOOM_WIFI_TO_ARM_AD_CLOSE, NULL, 0);
+	divoom_ad_mic_close();
+}
+
+char *divoom_ad_mic_read_aac(int *len)
+{
+	int temp_len;
+	char *temp = NULL;
+	*len = temp_len;
+	//temp = (char *)divoom_malloc(temp_len, DIVOOM_MODEL_LEAVE_MSG, __LINE__, __FILE__);
+	buf_read = malloc(temp_len);
+	int fd = open(DIVOOM_TEMP_AAC, O_RDWR);
+	int err = read(fd, temp, temp_len);
+
+	return temp;
+}
+
+int main()
+{
+		divoom_ad_mic_open();
+		divoom_ad_mic_read_leave_start();
+		divoom_ad_mic_close();
+		
+		return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

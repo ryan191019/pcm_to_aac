@@ -1,0 +1,506 @@
+//File   : lrecord.c  
+//Author : Loon <sepnic@gmail.com>  
+  
+#include <stdio.h>  
+#include <malloc.h>  
+#include <unistd.h>  
+#include <stdlib.h>  
+#include <string.h>  
+#include <getopt.h>  
+#include <fcntl.h>  
+#include <ctype.h>  
+#include <errno.h>  
+#include <limits.h>  
+#include <time.h>  
+#include <locale.h>  
+#include <sys/unistd.h>   
+#include <sys/stat.h>  
+#include <sys/types.h>  
+#include <assert.h>  
+#include "wav_parser.h"  
+#include "sndwav_common.h"  
+#include "debug.h"
+#include "qisr.h"
+#include "msp_cmn.h"
+#include "msp_errors.h"
+
+
+
+
+  
+#define DEFAULT_CHANNELS         (1)  
+#define DEFAULT_SAMPLE_RATE      (16000)  
+#define DEFAULT_SAMPLE_LENGTH    (16)  
+#define DEFAULT_DURATION_TIME    (10)  
+
+#define	BUFFER_SIZE	4096*2
+#define FRAME_LEN	640 
+#define HINTS_SIZE  100
+
+  
+int SNDWAV_PrepareWAVParams(WAVContainer_t *wav)  
+{  
+    assert(wav);  
+  
+    uint16_t channels = DEFAULT_CHANNELS;  
+    uint16_t sample_rate = DEFAULT_SAMPLE_RATE;  
+    uint16_t sample_length = DEFAULT_SAMPLE_LENGTH;  
+    uint32_t duration_time = DEFAULT_DURATION_TIME;  
+  
+    /* Const */  
+    wav->header.magic = WAV_RIFF;  
+    wav->header.type = WAV_WAVE;  
+    wav->format.magic = WAV_FMT;  
+    wav->format.fmt_size = LE_INT(16);  
+    wav->format.format = LE_SHORT(WAV_FMT_PCM);  
+    wav->chunk.type = WAV_DATA;  
+  
+    /* User definition */  
+    wav->format.channels = LE_SHORT(channels);  
+    wav->format.sample_rate = LE_INT(sample_rate);  
+    wav->format.sample_length = LE_SHORT(sample_length);  
+  
+    /* See format of wav file */  
+    wav->format.blocks_align = LE_SHORT(channels * sample_length / 8);  
+    wav->format.bytes_p_second = LE_INT((uint16_t)(wav->format.blocks_align) * sample_rate);  
+      
+    wav->chunk.length = LE_INT(duration_time * (uint32_t)(wav->format.bytes_p_second));  
+    wav->header.length = LE_INT((uint32_t)(wav->chunk.length) +  
+        sizeof(wav->chunk) + sizeof(wav->format) + sizeof(wav->header) - 8);  
+  
+    return 0;  
+}  
+  
+
+void SNDWAV_Record(SNDPCMContainer_t *sndpcm, WAVContainer_t *wav, int fd)  
+{  
+    off64_t rest;  
+    size_t c, frame_size;  
+      
+    if (WAV_WriteHeader(fd, wav) < 0) {  
+        exit(-1);  
+    }  
+  
+    rest = wav->chunk.length;  
+    while (rest > 0) {  
+        c = (rest <= (off64_t)sndpcm->chunk_bytes) ? (size_t)rest : sndpcm->chunk_bytes;  
+        frame_size = c * 8 / sndpcm->bits_per_frame;  
+        if (SNDWAV_ReadPcm(sndpcm, frame_size) != frame_size)  
+            break;  
+          
+        if (write(fd, sndpcm->data_buf, c) != c) {  
+           DEBUG_ERR( "Error SNDWAV_Record[write]/n");  
+            exit(-1);  
+        }  
+  
+        rest -= c;  
+    }  
+}  
+
+
+static int SNDWAV_Record1(SNDPCMContainer_t *sndpcm, WAVContainer_t *wav, int fd,  char *rec_result)  
+{  
+    off64_t rest;  
+    size_t c, frame_size;  
+	int ret;
+    const char*		session_id					=	NULL;
+	//char			rec_result[BUFFER_SIZE]		=	{NULL};	
+	char			hints[HINTS_SIZE]			=	{NULL}; 
+	unsigned int	total_len					=	0; 
+	int				aud_stat					=	MSP_AUDIO_SAMPLE_CONTINUE ;		
+	int				ep_stat						=	MSP_EP_LOOKING_FOR_SPEECH;		
+	int				rec_stat					=	MSP_REC_STATUS_SUCCESS ;			
+	int				errcode						=	MSP_SUCCESS ;
+
+	FILE*			f_pcm						=	NULL;
+	char*			p_pcm						=	NULL;  
+	const char* session_begin_params	=	"sub = iat, ssm=1 ,domain = iat, language = zh_ch, accent = mandarin, sample_rate = 16000,result_type = plain, result_encoding = utf8, sch = 1,nlp_version=2.0, aue=raw";
+    if (WAV_WriteHeader(fd, wav) < 0) {  
+        exit(-1);  
+    }  
+	
+	
+	session_id = QISRSessionBegin(NULL, session_begin_params, &errcode); //听写不需要语法，第一个参数为NULL
+	if (MSP_SUCCESS != errcode) {
+				DEBUG_ERR("QISRSessionBegin failed! error code:%d", errcode);
+				goto iat_exit;
+	}
+	
+    rest = wav->chunk.length;  
+    while (rest > 0) {  
+        c = (rest <= (off64_t)sndpcm->chunk_bytes) ? (size_t)rest : sndpcm->chunk_bytes;  
+        frame_size = c * 8 / sndpcm->bits_per_frame;  
+        if (SNDWAV_ReadPcm(sndpcm, frame_size) != frame_size)  
+            break;  
+
+        if (write(fd, sndpcm->data_buf, c) != c) {  
+           DEBUG_ERR( "Error SNDWAV_Record[write]/n");  
+            exit(-1);  
+        }  
+
+		ret = QISRAudioWrite(session_id, (const void *)sndpcm->data_buf, c, aud_stat, &ep_stat, &rec_stat);
+
+		if (MSP_SUCCESS != ret) {
+				DEBUG_ERR("\nQISRAudioWrite failed! error code:%d", ret);
+				goto iat_exit;
+		}
+		rest -= c;  
+		if (MSP_REC_STATUS_SUCCESS == rec_stat) 
+			{
+				const char *rslt = QISRGetResult(session_id, &rec_stat, 0, &errcode);
+				if (MSP_SUCCESS != errcode)
+				{
+					DEBUG_ERR("QISRGetResult failed! error code: %d", errcode);
+					goto iat_exit;
+				}
+				if (NULL != rslt)
+				{
+					unsigned int rslt_len = strlen(rslt);
+					total_len += rslt_len;
+					if (total_len >= BUFFER_SIZE)
+					{
+						DEBUG_ERR("no enough buffer for rec_result !");
+						goto iat_exit;
+					}
+					strncat(rec_result, rslt, rslt_len);
+				}
+			}
+			
+		if (MSP_EP_AFTER_SPEECH == ep_stat)
+				break;
+		
+        
+    }
+	errcode = QISRAudioWrite(session_id, NULL, 0, MSP_AUDIO_SAMPLE_LAST, &ep_stat, &rec_stat);
+	if (MSP_SUCCESS != errcode){
+		DEBUG_ERR("QISRAudioWrite failed! error code:%d ", errcode);
+			goto iat_exit;	
+	}
+
+	while (MSP_REC_STATUS_COMPLETE != rec_stat) {
+			const char *rslt = QISRGetResult(session_id, &rec_stat, 0, &errcode);
+			if (MSP_SUCCESS != errcode)
+			{
+				DEBUG_ERR("QISRGetResult failed, error code: %d", errcode);
+				goto iat_exit;
+			}
+			if (NULL != rslt)
+			{
+				unsigned int rslt_len = strlen(rslt);
+				total_len += rslt_len;
+				if (total_len >= BUFFER_SIZE)
+				{
+					DEBUG_ERR("no enough buffer for rec_result !");
+					goto iat_exit;
+				}
+				strncat(rec_result, rslt, rslt_len);
+		}
+	}  
+iat_exit:
+
+	QISRSessionEnd(session_id, hints);
+	return errcode;
+}
+
+ssize_t SNDWAV_P_SaveRead(int fd, void *buf, size_t count)  
+{  
+    ssize_t result = 0, res;  
+  
+    while (count > 0) {  
+        if ((res = read(fd, buf, count)) == 0)  
+            break;  
+        if (res < 0)  
+            return result > 0 ? result : res;  
+        count -= res;  
+        result += res;  
+        buf = (char *)buf + res;  
+    }  
+    return result;  
+}  
+  
+void SNDWAV_Play(SNDPCMContainer_t *sndpcm, WAVContainer_t *wav, int fd)  
+{  
+    int load, ret;  
+    off64_t written = 0;  
+    off64_t c;  
+    off64_t count = LE_INT(wav->chunk.length);  
+  
+    load = 0;  
+    while (written < count) {  
+        /* Must read [chunk_bytes] bytes data enough. */  
+        do {  
+            c = count - written;  
+            if (c > sndpcm->chunk_bytes)  
+                c = sndpcm->chunk_bytes;  
+            c -= load;  
+  
+            if (c == 0)  
+                break;  
+            ret = SNDWAV_P_SaveRead(fd, sndpcm->data_buf + load, c);  
+            if (ret < 0) {  
+               DEBUG_ERR( "Error safe_read/n");  
+                exit(-1);  
+            }  
+            if (ret == 0)  
+                break;  
+            load += ret;  
+        } while ((size_t)load < sndpcm->chunk_bytes);  
+  
+        /* Transfer to size frame */  
+        load = load * 8 / sndpcm->bits_per_frame;  
+        ret = SNDWAV_WritePcm(sndpcm, load);  
+        if (ret != load)  
+            break;  
+          
+        ret = ret * sndpcm->bits_per_frame / 8;  
+        written += ret;  
+        load = 0;  
+    }  
+}   
+
+
+
+int aplay_init(SNDPCMContainer_t *playback, SNDPCMParams_t *params)
+{
+    char *devicename = "default";    
+  
+    if (snd_output_stdio_attach(&playback->log, stderr, 0) < 0) {  
+        DEBUG_ERR("Error snd_output_stdio_attach");  
+        goto Err;  
+    }  
+  
+    if (snd_pcm_open(&playback->handle, devicename, SND_PCM_STREAM_PLAYBACK, 0) < 0) {  
+         DEBUG_ERR("Error snd_pcm_open [ %s]", devicename);  
+        goto Err;  
+    }  
+
+	if (SND_SetParams(playback, params)) {  
+       	DEBUG_ERR( "Error SND_SetParams");  
+        goto Err;  
+    } 
+	DEBUG_INFO("After SND_SetParams");
+	return 0;
+Err:  
+	if (playback->data_buf) free(playback->data_buf);  
+	if (playback->log) snd_output_close(playback->log);  
+	if (playback->handle) snd_pcm_close(playback->handle);  
+	return 1;
+  
+}
+
+int aplay_close(SNDPCMContainer_t *playback) 
+{
+	if (playback->handle) snd_pcm_drain(playback->handle);
+	if (playback->data_buf) free(playback->data_buf);  
+    if (playback->log) snd_output_close(playback->log);  
+    if (playback->handle) snd_pcm_close(playback->handle); 
+}
+
+
+int aplay1(const char *filename, SNDPCMParams_t *params)   
+{  
+
+		int fd;  
+		WAVContainer_t wav;  
+		SNDPCMContainer_t playback;  
+		  
+		memset(&playback, 0x0, sizeof(playback));  
+	  
+		fd = open(filename, O_RDONLY);	
+		if (fd < 0) {  
+		   DEBUG_ERR( "Error open [%s]/n", filename);  
+			return -1;	
+		}  
+		      
+	    if (WAV_ReadHeader(fd, &wav) < 0) {  
+	       DEBUG_ERR( "Error WAV_Parse [%s]/n", filename);  
+	        goto Err;  
+	    }   
+
+
+		DEBUG_INFO("wav.format.format=%d",LE_SHORT(wav.format.format));
+		DEBUG_INFO("wav.format.channels=%d",LE_SHORT(wav.format.channels));
+		DEBUG_INFO("wav.format.sample_rate=%d",LE_INT(wav.format.sample_rate));
+
+
+		aplay_init(&playback,params);
+	  
+		SNDWAV_Play(&playback, &wav, fd);  
+	  
+		//snd_pcm_drain(playback.handle);  
+		aplay_close(&playback);
+		close(fd);	
+	  	return 0;
+	Err:  
+		close(fd);	
+		if (playback.data_buf) free(playback.data_buf);  
+		if (playback.log) snd_output_close(playback.log);  
+		if (playback.handle) snd_pcm_close(playback.handle);  
+		return -1;	
+}  
+
+
+static int aplay(const char *filename)  
+{  
+
+    char *devicename = "default";  
+    int fd;  
+    WAVContainer_t wav;  
+    SNDPCMContainer_t playback;  
+      
+    memset(&playback, 0x0, sizeof(playback));  
+  
+    fd = open(filename, O_RDONLY);  
+    if (fd < 0) {  
+       DEBUG_ERR( "Error open [%s]/n", filename);  
+        return -1;  
+    }  
+      
+    if (WAV_ReadHeader(fd, &wav) < 0) {  
+       DEBUG_ERR( "Error WAV_Parse [%s]/n", filename);  
+        goto Err;  
+    }  
+  	DEBUG_INFO("wav.format.format=%d",LE_SHORT(wav.format.format));
+		DEBUG_INFO("wav.format.channels=%d",LE_SHORT(wav.format.channels));
+		DEBUG_INFO("wav.format.sample_rate=%d",LE_INT(wav.format.sample_rate));
+
+    if (snd_output_stdio_attach(&playback.log, stderr, 0) < 0) {  
+       DEBUG_ERR( "Error snd_output_stdio_attach/n");  
+        goto Err;  
+    }  
+  
+    if (snd_pcm_open(&playback.handle, devicename, SND_PCM_STREAM_PLAYBACK, 0) < 0) {  
+       DEBUG_ERR( "Error snd_pcm_open [ %s]/n", devicename);  
+        goto Err;  
+    }  
+  
+    if (SNDWAV_SetParams(&playback, &wav) < 0) {  
+       DEBUG_ERR( "Error set_snd_pcm_params/n");  
+        goto Err;  
+    }  
+    //snd_pcm_dump(playback.handle, playback.log);  
+  
+    SNDWAV_Play(&playback, &wav, fd);  
+  
+    snd_pcm_drain(playback.handle);  
+  
+    close(fd);  
+    free(playback.data_buf);  
+    snd_output_close(playback.log);  
+    snd_pcm_close(playback.handle);  
+    return 0;  
+  
+Err:  
+    close(fd);  
+    if (playback.data_buf) free(playback.data_buf);  
+    if (playback.log) snd_output_close(playback.log);  
+    if (playback.handle) snd_pcm_close(playback.handle);  
+    return -1;  
+}  
+
+int arecord(const char *filename, char *result)  
+{  
+	int ret ;
+    char *devicename = "default";  
+    int fd;  
+    WAVContainer_t wav;  
+    SNDPCMContainer_t record;  
+
+      
+    memset(&record, 0x0, sizeof(record));  
+  
+    remove(filename);  
+    if ((fd = open(filename, O_WRONLY | O_CREAT, 0644)) == -1) {  
+       DEBUG_ERR( "Error open: [%s]/n", filename);  
+        return -1;  
+    }  
+  
+    if (snd_output_stdio_attach(&record.log, stderr, 0) < 0) {  
+       DEBUG_ERR( "Error snd_output_stdio_attach/n");  
+        goto Err;  
+    }  
+  
+    if (snd_pcm_open(&record.handle, devicename, SND_PCM_STREAM_CAPTURE, 0) < 0) {  
+       DEBUG_ERR( "Error snd_pcm_open [ %s]/n", devicename);  
+        goto Err;  
+    }  
+  
+    if (SNDWAV_PrepareWAVParams(&wav) < 0) {  
+       DEBUG_ERR( "Error SNDWAV_PrepareWAVParams/n");  
+        goto Err;  
+    }  
+  
+    if (SNDWAV_SetParams(&record, &wav) < 0) {  
+       DEBUG_ERR( "Error set_snd_pcm_params/n");  
+        goto Err;  
+    }  
+   // snd_pcm_dump(record.handle, record.log);  
+  
+   	ret = SNDWAV_Record1(&record, &wav, fd, result);  
+  
+    snd_pcm_drain(record.handle);  
+  
+    close(fd);  
+    free(record.data_buf);  
+    snd_output_close(record.log);  
+    snd_pcm_close(record.handle);  
+    return ret;  
+  
+Err:  
+    close(fd);  
+    remove(filename);  
+    if (record.data_buf) free(record.data_buf);  
+    if (record.log) snd_output_close(record.log);  
+    if (record.handle) snd_pcm_close(record.handle);  
+    return -1;  
+}  
+
+
+int main(int argc, char *argv[])  
+{  
+	int  ret =	MSP_SUCCESS;
+	int times = 0;
+	int music_flag; 
+	 
+	const char* login_params =	"appid = 572aa13f, work_dir = ."; 
+		
+		/* 用户登录 */
+	ret = MSPLogin(NULL, NULL, login_params);//第一个参数是用户名，第二个参数是密码，均传NULL即可，第三个参数是登录参数	
+	if (MSP_SUCCESS != ret) {
+				printf("MSPLogin failed , Error code %d.\n",ret);
+				goto exit; //登录失败，退出登录
+	}
+	char	rec_result[BUFFER_SIZE]		=	{NULL};	
+	DEBUG_INFO("start capture....");
+	while(1){
+		memset(rec_result, 0, BUFFER_SIZE);
+		ret = arecord("/tmp/snd.wav",&rec_result);		
+		if(ret == MSP_ERROR_TIME_OUT || ret == MSP_ERROR_NET_GENERAL || ret ==MSP_ERROR_NET_DNS  ) {
+						DEBUG_INFO("网络错误");
+						aplay("/root/res/noconnect.wav");
+						break;
+		}
+		ret = parse_json(rec_result, &music_flag);
+		DEBUG_INFO("ret=%d",ret);
+		if(ret != 0 ){
+					//break;
+					times++;
+		}
+		
+		if(ret == 0 || times ==2){
+			times = 0;
+			DEBUG_INFO("uartdfifo.sh tlkoff");
+			break;
+		}
+		aplay("/root/res/searchstart.wav");
+	}
+	//if(music_flag
+	//aplay("/tmp/answer.wav");
+	if(music_flag == 0  && ret == 0)
+			system("mpc play");
+			  
+
+ exit:
+ 	MSPLogout(); //退出登录
+ 	return ret;
+}  
